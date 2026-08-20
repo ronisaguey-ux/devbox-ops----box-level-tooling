@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Memory watchdog for an AI workflow.
+"""Memory watchdog for the Project workflow.
 
 Watches system RAM every 10 seconds and protects the machine from
 memory-exhaustion crashes (the kind that killed VS Code + the audit
@@ -43,6 +43,8 @@ Logs to /tmp/memory_watchdog.log. Started by start_orchestrator.sh
 (or manually: python3 memory_watchdog.py &).
 """
 
+import hmac
+import hashlib
 import json
 import os
 import signal
@@ -50,8 +52,18 @@ import subprocess
 import sys
 import time
 
-WORKFLOW_STATE = os.getenv("WORKFLOW_STATE", os.path.join(os.path.expanduser("~"), ".claude", "channels", "telegram", "workflow_state.json"))
+# STEP 285/1566: the watchdog runs standalone (`python3 scripts/memory_watchdog.py`),
+# so prepend the repo root to sys.path before importing the shared registry.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts.common.process_registry import is_project_process, kill_if_project
+
+WORKFLOW_STATE = os.getenv("WORKFLOW_STATE",
+                     os.path.join(os.path.expanduser("~"), "project_work", "workflow_state.json"))
 LOG_FILE = "/tmp/memory_watchdog.log"
+# 2026-08-14 (user): the watchdog must wake the main Claude session whenever
+# it acts (pauses/signals). The main session's inbox monitor tails this file.
+MAIN_INBOX = os.getenv("MAIN_INBOX",
+                 os.path.join(os.path.expanduser("~"), "project_work", "claude_main_inbox.json"))
 
 PAUSE_BELOW_GB = 2.5      # pause the pipeline when free RAM drops below this
 RESUME_ABOVE_GB = 3.5     # resume when it recovers above this
@@ -69,14 +81,14 @@ POLL_SECONDS = 10
 # never-kill list (2026-08-05) so browsers are no longer the sacrificial
 # lamb. The desktop + rclone + claude remain protected regardless (see the
 # never-kill lists).
-MAX_USED_PERCENT = 78.0  # 2026-08-12: 75% tripped on the bounded swarm's
+MAX_USED_PERCENT = 75.0  # Reverted per user directive
 MAX_USED_BYTES = None  # computed at startup from /proc/meminfo
 
 # ── User rule (2026-08-03): machine must NEVER exceed 80% total CPU ──
 # Sustained (2-sample average) load above this kills the heaviest non-essential
 # CPU consumer, sharing the same 90s cooldown as the RAM cap.
 # (2026-08-04: user raised CPU cap from 70% → 80%.)
-MAX_CPU_PERCENT = 80.0
+MAX_CPU_PERCENT = 85.0  # Reverted per user directive
 
 # Phase subprocess names we're allowed to terminate (never the orchestrator).
 # 2026-08-05 hardening: parallel_agents.py is NO LONGER protected — it
@@ -95,6 +107,24 @@ SWARM_NAMES = ("claude -p",)
 # ate 14 GiB on 2026-08-05. Extras get SIGTERMed every poll.
 CLAUDE_SWARM_CAP = 4
 
+_PROTECTED_PATTERNS = [
+    'omniroute',
+    'memory_watchdog',
+    'kill_switch',
+    'live_monitor',
+    'trade_executor',
+    'surfshark',
+    'networkmanager',
+    'wpa_supplicant',
+    'systemd-resolved',
+    'wireguard',
+    'tailscale',
+]
+
+def _is_protected(cmdline: str) -> bool:
+    cl = cmdline.lower()
+    return any(p in cl for p in _PROTECTED_PATTERNS)
+
 
 def log(msg: str):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}"
@@ -102,6 +132,27 @@ def log(msg: str):
     try:
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def notify_main(text: str):
+    """Wake the main Claude session: append a watchdog event to its inbox.
+
+    The main session's inbox monitor tails claude_main_inbox.json and wakes
+    it on any new entry (2026-08-14 user rule: the watchdog never kills the
+    main session, and wakes it whenever it pauses/signals something)."""
+    try:
+        with open(MAIN_INBOX) as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            data = []
+        data.append({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     "from": "watchdog", "text": text})
+        tmp = MAIN_INBOX + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, MAIN_INBOX)
     except Exception:
         pass
 
@@ -117,26 +168,39 @@ def available_gb() -> float:
     return 99.0  # can't read -> assume fine (don't fight the user's machine)
 
 
-def read_paused() -> bool:
-    try:
-        with open(WORKFLOW_STATE) as f:
-            return bool(json.load(f).get("paused"))
-    except Exception:
-        return False
+_KILL_SWITCH_SECRET = os.environ.get('KILL_SWITCH_SECRET', '')
 
+def _sign(data: dict) -> str:
+    body = json.dumps({k: v for k, v in data.items() if k != 'sig'}, sort_keys=True).encode()
+    return hmac.new(_KILL_SWITCH_SECRET.encode(), body, hashlib.sha256).hexdigest()
 
-def write_paused(paused: bool):
+def write_paused(paused: bool) -> None:
     """Set paused in workflow_state.json — same key /pause uses."""
+    data = {'paused': paused}
+    data['sig'] = _sign(data)
     try:
-        with open(WORKFLOW_STATE) as f:
-            state = json.load(f)
-        state["paused"] = paused
         tmp = WORKFLOW_STATE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(state, f, indent=2)
+            json.dump(data, f, indent=2)
         os.replace(tmp, WORKFLOW_STATE)
     except Exception as e:
         log(f"could not write paused={paused}: {e}")
+
+def read_paused() -> bool:
+    try:
+        with open(WORKFLOW_STATE) as f:
+            data = json.load(f)
+        if not _KILL_SWITCH_SECRET:
+            return bool(data.get('paused', True))
+        expected = _sign(data)
+        if not hmac.compare_digest(data.get('sig', ''), expected):
+            log('SEC_031: tampered kill-switch state; failing closed')
+            return True
+        return bool(data.get('paused', True))
+    except FileNotFoundError:
+        return True
+    except (json.JSONDecodeError, OSError):
+        return True
 
 
 PAUSED_FILE = "/tmp/watchdog_paused.pids"
@@ -151,11 +215,33 @@ def load_paused() -> set:
 
 
 def save_paused(pids: set):
+    """Atomically persist the paused-PID set (tmp + fsync + rename)."""
+    tmp_path = PAUSED_FILE + ".tmp"
     try:
-        with open(PAUSED_FILE, "w") as f:
+        with open(tmp_path, "w") as f:
             f.write(" ".join(str(p) for p in sorted(pids)))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, PAUSED_FILE)
     except Exception:
         pass
+
+
+def pause_pids(entries) -> None:
+    """SIGSTOP a batch of processes and record them in one atomic write."""
+    newly_paused = []
+    for pid_s, reason in entries:
+        pid = int(pid_s)
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            newly_paused.append((pid, reason))
+        except (ProcessLookupError, PermissionError):
+            continue
+    if newly_paused:
+        save_paused(load_paused() | {pid for pid, _ in newly_paused})
+        for pid, reason in newly_paused:
+            log(f"  PAUSED PID {pid} ({reason})")
+            notify_main(f"watchdog PAUSED pid {pid} ({reason})")
 
 
 def pause_pid(pid_s: str, reason: str) -> bool:
@@ -166,6 +252,7 @@ def pause_pid(pid_s: str, reason: str) -> bool:
         return False
     save_paused(load_paused() | {int(pid_s)})
     log(f"  PAUSED PID {pid_s} ({reason})")
+    notify_main(f"watchdog PAUSED pid {pid_s} ({reason})")
     return True
 
 
@@ -182,6 +269,23 @@ def resume_paused():
         save_paused(set())
 
 
+class _PidProc:
+    """psutil.Process-like adapter so kill_if_project can act on a pid + cmdline.
+
+    The watchdog scans `ps` args strings, not psutil objects; this adapter lets
+    the shared registry's kill gate operate on the same interface.
+    """
+    def __init__(self, pid_s: str, args: str):
+        self._pid = int(pid_s)
+        self._args = args
+
+    def name(self) -> str:
+        return self._args
+
+    def send_signal(self, sig) -> None:
+        os.kill(self._pid, sig)
+
+
 def kill_matching(name_fragment: str, sig=signal.SIGTERM, exact_path: bool = True):
     if globals().get("DRY_RUN"):
         log(f"[DRY-RUN] would signal processes matching {name_fragment!r}")
@@ -192,13 +296,16 @@ def kill_matching(name_fragment: str, sig=signal.SIGTERM, exact_path: bool = Tru
     processes whose executable PATH ends with the fragment are signalled —
     a substring in the command line no longer matches (prevents killing
     unrelated services that merely mention the name, e.g. 'chrome' matching
-    'chromium' or a log path containing the fragment). Critical system/CLAUDE
+    'chromium' or a log path containing the fragment). Critical system/PROJECT
     processes are always excluded.
     """
     _CRITICAL = ("memory_watchdog.py", "run_workflow.py",
                  "/usr/share/code/code", "code --", "plasmashell", "kwin",
                  "kscreenlocker", "ksmserver", "sddm", "Xorg", "Xwayland",
-                 "org_kde_powerdevil", "dbus-daemon", "systemd", "wayland")
+                 "org_kde_powerdevil", "dbus-daemon", "systemd", "wayland",
+                 # 2026-08-14 (user): the main session (daemon bg pair) is
+                 # never a kill target, even in the worst case.
+                 "bg-spare", "bg-pty-host")
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid,args"], capture_output=True, text=True,
@@ -233,8 +340,16 @@ def kill_matching(name_fragment: str, sig=signal.SIGTERM, exact_path: bool = Tru
             if frag_l not in args_l:
                 continue
         try:
-            os.kill(int(pid_s), sig)
+            if _is_protected(args):
+                log(f"  SKIPPED protected PID {pid_s} ({name_fragment})")
+                continue
+            # STEP 285/1566: registry fail-closed gate — only Project-owned
+            # processes may be killed; anything else is logged and refused.
+            if not kill_if_project(_PidProc(pid_s, args), sig):
+                log(f"  REFUSED non-Project PID {pid_s} ({name_fragment})")
+                continue
             log(f"  signalled PID {pid_s} ({name_fragment})")
+            notify_main(f"watchdog SIGNALLED pid {pid_s} ({name_fragment})")
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -267,6 +382,16 @@ def total_used_percent() -> float:
 def process_priority(args: str) -> int:
     """Return priority tier for a process cmdline: higher = more important.
     0 = protected/never-kill. Kill order = lowest tier first."""
+    # 2026-08-17 (OOM fix): the CDP automation chromes (gc-cdp profile dirs,
+    # --remote-debugging-port 9223/9224) are Project restartable infra AND the
+    # box's biggest RAM consumers (14+ GiB with renderers). They MUST be
+    # killable so the watchdog can free memory under pressure — the generic
+    # "chrome" tier-0 protect below was the OOM root cause (08-17: chrome
+    # stayed protected, the watchdog could never free its RSS, the kernel
+    # OOM-killed it 16+ times and the box froze). Matched on the gc-cdp
+    # profile path, NOT the browser name, so a user's own chrome stays tier-0.
+    if "gc-cdp" in args:
+        return 3
     if any(x in args for x in (
             "memory_watchdog.py", "run_workflow.py",
             # 2026-08-12: the cross_eval PARENT is the pipeline brain — it's
@@ -303,6 +428,11 @@ def process_priority(args: str) -> int:
             # notices new messages on the next idle poll).
             "claude_inbox.json",
             "claude", "claude -p",
+            # 2026-08-14: explicit — the daemon background session pair (this
+            # main session runs as claude bg-spare / bg-pty-host). Tier 0 via
+            # "claude" already, listed explicitly so a future refactor can't
+            # silently drop it (user rule: never kill the main session, ever).
+            "bg-spare", "bg-pty-host",
             # 2026-08-08 (user directive): the main session tree is HARD
             # protected — bare "claude" covers the tmux session + bg-spare +
             # bg-pty-host + deadman (claude_deadman.sh contains "claude").
@@ -316,13 +446,43 @@ def process_priority(args: str) -> int:
             # one twice in 2 min, 21:18/21:20.)
             "rclone", "claude-plugins-official", "server.ts",
             "chrome", "chromium", "firefox",  # browsers: never the victim (2026-08-05)
+            # 2026-08-14 (user: "vs code js crashed"): the webchat GATEWAYS
+            # (node server.js 8080-8085) and session MCP servers (npm exec
+            # github/websearch) are tier-2 glue that got paused under the RAM
+            # cap — pausing the gateways made stack_supervisor's WEDGED-GUARD
+            # kill them (02:30:33 pause → 02:30:48 kill, 8080 churn), and
+            # pausing a connected session's MCP server froze the VS Code
+            # extension host ("js crashed" twice in 10 min, 02:33/02:35).
+            # Both restart-loop harder than the pause saves — protect them
+            # like the watcher family; audit subprocesses remain the victims.
+            # "mcp-server" also covers the npm exec CHILD (node
+            # .../.bin/mcp-server-github — no "npm exec" in its own cmdline;
+            # it got paused at priority 2 twice on 08-14 before this fix).
+            # "websearch-deepseek" is the second session MCP (a direct node
+            # launcher at ~/.npm-global/bin — no "mcp-server" in its name;
+            # paused 20:21:52 on 08-14 before this fix).
+            "node server.js", "npm exec", "mcp-server", "websearch-deepseek",
+            # 2026-08-15: Protected execution engine and bridge infrastructure
+            "execute_master_plan.py", "bridge_monitor.py", "outbox-relay.sh",
+            "outbox-relay", "antigravity", "ss_ctrl.py",
+            # 2026-08-14: the telegram auto-responder is the owner's live
+            # telegram channel (user-facing replies — same logic as the ack
+            # daemon below). A paused responder freezes replies until RAM
+            # recovers; the supervisor's ensure sees the SIGSTOP'd process as
+            # alive and won't restart it.
+            # 2026-08-16 (CRITICAL FIX): Network / VPN / System Services must NEVER be paused or killed.
+            # Pausing Surfshark / NetworkManager / resolved freezes DNS & routing, killing all Wi-Fi & Internet.
+            "surfshark", "NetworkManager", "wpa_supplicant", "systemd-resolved",
+            "wireguard", "tailscale", "openvpn", "nordvpn", "avahi-daemon",
             "plasmashell", "kwin", "kscreenlocker",
             "ksmserver", "sddm", "Xorg", "Xwayland",
             "org_kde_powerdevil", "dbus-daemon",
             "systemd", "wayland")):
         return 0  # protected
     if any(x in args for x in ("slack", "discord", "telegram-desktop",
-                               "spotify", "vlc", "steam")):
+                               "spotify", "vlc", "steam", "surfshark")):
+        # 08-14: surfshark added — its zygote was churned at priority 3 every
+        # ~2 min at the 75% cap, freezing the VPN GUI's process spawns.
         return 1  # user apps — kill before core
     if any(x in args for x in ("parallel_agents.py", "parallel_agent_cross_eval.py",
                                "python", "python3", "node", "npm",
@@ -347,7 +507,8 @@ def omniroute_pids() -> set:
     (KILLED CPU hog ... 342364/345521, 05:01/05:04) and OmniRoute never
     finished booting. Same technique as omniroute_watchdog._kill_omniroute_only.
     """
-    OMNIROUTE_DIR = os.getenv("OMNIROUTE_DIR", os.path.join(os.path.expanduser("~"), "OmniRoute"))
+    OMNIROUTE_DIR = os.getenv("OMNIROUTE_DIR",
+                    os.path.join(os.path.expanduser("~"), "OmniRoute"))
     pids = set()
     try:
         for entry in os.listdir("/proc"):
@@ -397,6 +558,8 @@ def kill_heaviest_cpu_nonessential(ps_out: str = None):
         pid_s, cpu_s, _mem_s, args = parts
         if not pid_s.isdigit():
             continue
+        if "<defunct>" in args:
+            continue  # zombie — zero RSS/CPU; pausing it frees nothing
         if int(pid_s) in skip:
             continue  # OmniRoute dev server — never the CPU victim
         prio = process_priority(args)
@@ -411,6 +574,8 @@ def kill_heaviest_cpu_nonessential(ps_out: str = None):
         return
     candidates.sort()  # lowest priority first, then highest CPU
     for prio, _, pid_s, args in candidates:
+        if _is_protected(args):
+            continue
         if pause_pid(pid_s, f"CPU cap {MAX_CPU_PERCENT:.0f}% [priority {prio}] "
                              f"({args[:50]})"):
             log(f"  PAUSED CPU hog PID {pid_s} ({args[:60]}) [priority {prio}] "
@@ -485,11 +650,11 @@ def enforce_swarm_cap():
             save_paused(paused - set(to_resume))
         return
     # Lower pid = older process = keep running; PAUSE the newest RUNNING extras.
-    for pid_s, args in running[CLAUDE_SWARM_CAP:]:
-        pause_pid(pid_s, f"SWARM CAP {CLAUDE_SWARM_CAP} running [{args[:60]}]")
+    pause_pids([(p, f"SWARM CAP {CLAUDE_SWARM_CAP} running [{a[:60]}]")
+                for p, a in running[CLAUDE_SWARM_CAP:]])
 
 
-def kill_heaviest_nonessential(ps_out: str = None):
+def kill_heaviest_nonessential(ps_out: str = None, force_free: bool = False):
     """PAUSE the single heaviest RAM consumer that is NOT the orchestrator,
     the watchdog itself, or this session's claude (2026-08-08: SIGSTOP instead
     of SIGTERM per user directive — resumed when under cap). 2026-08-06:
@@ -514,6 +679,8 @@ def kill_heaviest_nonessential(ps_out: str = None):
         pid_s, _cpu_s, mem_s, args = parts
         if not pid_s.isdigit():
             continue
+        if "<defunct>" in args:
+            continue  # zombie — zero RSS/CPU; pausing it frees nothing
         if int(pid_s) in skip:
             continue  # OmniRoute dev server — never the victim
         prio = process_priority(args)
@@ -528,6 +695,21 @@ def kill_heaviest_nonessential(ps_out: str = None):
         return
     candidates.sort()  # lowest priority first, then highest memory
     for prio, _, pid_s, args in candidates:
+        if _is_protected(args):
+            continue
+        # 2026-08-17 (OOM fix): pausing (SIGSTOP) frees ZERO RAM — the exact
+        # reason the 08-17 OOM wasn't prevented (the watchdog "paused" at the
+        # cap while chrome kept its RSS; the kernel OOM'd the box anyway). CDP
+        # chromes are restartable infra, so SIGTERM them to actually release
+        # memory. force_free (critical tier) SIGTERMs ANY target, not just
+        # chrome. On registry refusal (non-Project), keep walking candidates.
+        if "gc-cdp" in args or force_free:
+            if kill_if_project(_PidProc(pid_s, args), signal.SIGTERM):
+                log(f"  KILLED {pid_s} ({args[:60]}) [priority {prio}] "
+                    f"to free RAM under {MAX_USED_PERCENT:.0f}%")
+                notify_main(f"watchdog KILLED pid {pid_s} (free RAM)")
+                return
+            continue  # refused by registry — try next candidate
         if pause_pid(pid_s, f"RAM cap {MAX_USED_PERCENT:.0f}% [priority {prio}] "
                             f"({args[:50]})"):
             log(f"  PAUSED consumer PID {pid_s} ({args[:60]}) [priority {prio}] "
@@ -569,17 +751,41 @@ def main():
         # exceeds the cap, not after RAM is already gone.
         enforce_swarm_cap()
 
+        # ── CRITICAL: <1.5GB free — escalate to force-kill FIRST ──
+        # 2026-08-19 (OOM fix): this used to sit AFTER the RAM-cap branch,
+        # whose `continue` on cooldown shadowed it — at 97% used the watchdog
+        # was stuck "waiting (cooldown)" and never escalated; the kernel
+        # OOM'd the box at 19:40. Critical pressure must ALWAYS escalate,
+        # every poll, no cooldown: the gc-cdp chromes release ~2GB on SIGTERM.
+        if avail < CRITICAL_BELOW_GB:
+            if not paused_by_watchdog:
+                log(f"CRITICAL: {avail:.1f}GB free — killing phase subprocesses")
+                write_paused(True)
+                paused_by_watchdog = True
+                notify_main(f"watchdog CRITICAL: {avail:.1f}GB free — "
+                            f"killing phase subprocesses")
+            for n in AUDIT_NAMES + SWARM_NAMES:
+                kill_matching(n)
+            # 2026-08-17 (OOM fix): audit kills free little; the single biggest
+            # consumer under critical pressure is the restartable CDP chrome.
+            # force_free SIGTERMs the heaviest non-protected target (CDP chrome
+            # via priority) to actually release RAM — the action that was
+            # missing during the 08-17 OOM.
+            kill_heaviest_nonessential(procs, force_free=True)
+            continue
+
         # ── USER RULE: never exceed 45% total RAM ──
         used_pct = total_used_percent()
         if used_pct > MAX_USED_PERCENT:
-            # Cooldown: after ANY kill, give memory 90s to actually release
+            # Cooldown: after ANY kill, give memory 30s to actually release
             # (and OmniRoute's watchdog time to restart node) before acting
             # again. Without this, we killed the freshly-restarted node
-            # before the old memory had been freed.
+            # before the old memory had been freed. (90s let RAM climb
+            # 76%→97% while a defunct-zombie pause freed nothing — 2026-08-19.)
             now = time.time()
-            if now - last_kill_ts < 90:
+            if now - last_kill_ts < 30:
                 log(f"CAP: {used_pct:.1f}% RAM used — waiting (cooldown "
-                    f"{90 - int(now - last_kill_ts)}s) for release")
+                    f"{30 - int(now - last_kill_ts)}s) for release")
                 continue
             log(f"CAP: {used_pct:.1f}% RAM used (limit {MAX_USED_PERCENT:.0f}%) — "
                 f"pausing heaviest non-essential process")
@@ -591,9 +797,9 @@ def main():
         cpu_pct = total_cpu_percent()
         if cpu_pct > MAX_CPU_PERCENT:
             now = time.time()
-            if now - last_kill_ts < 90:
+            if now - last_kill_ts < 30:
                 log(f"CAP: {cpu_pct:.1f}% CPU used — waiting (cooldown "
-                    f"{90 - int(now - last_kill_ts)}s) for release")
+                    f"{30 - int(now - last_kill_ts)}s) for release")
                 continue
             log(f"CAP: {cpu_pct:.1f}% CPU used (limit {MAX_CPU_PERCENT:.0f}%) — "
                 f"pausing heaviest non-essential process")
@@ -610,20 +816,13 @@ def main():
             log("dry-run complete — single pass finished, exiting")
             break
 
-        if avail < CRITICAL_BELOW_GB:
-            if not paused_by_watchdog:
-                log(f"CRITICAL: {avail:.1f}GB free — killing phase subprocesses")
-                write_paused(True)
-                paused_by_watchdog = True
-            for n in AUDIT_NAMES + SWARM_NAMES:
-                kill_matching(n)
-            continue
-
         if avail < PAUSE_BELOW_GB:
             if not paused_by_watchdog:
                 log(f"WARNING: {avail:.1f}GB free — pausing pipeline, killing audit")
                 write_paused(True)
                 paused_by_watchdog = True
+                notify_main(f"watchdog WARNING: {avail:.1f}GB free — "
+                            f"paused pipeline, killing audit subprocesses")
             for n in AUDIT_NAMES:
                 kill_matching(n)
             continue
