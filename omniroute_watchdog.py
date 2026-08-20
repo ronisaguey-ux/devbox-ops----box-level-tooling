@@ -8,7 +8,7 @@ audit produces a false '0 findings' report (fixed by the hard-fail guard).
 This watchdog:
   - Probes http://localhost:20128/api/v1/models every 30s
   - If the port is dead or the probe fails twice in a row, restarts OmniRoute
-    via `npm run dev` in $OMNIROUTE_DIR
+    via `npm run dev` in ~/OmniRoute
   - Logs every probe/restart to /tmp/omniroute_watchdog.log
 
 Run: python3 scripts/omniroute_watchdog.py &   (or via start_orchestrator.sh)
@@ -17,12 +17,18 @@ Run: python3 scripts/omniroute_watchdog.py &   (or via start_orchestrator.sh)
 import os
 import signal
 import subprocess
+import sys
 import time
 import urllib.request
 
-OMNIROUTE_DIR = os.getenv("OMNIROUTE_DIR", os.path.join(os.path.expanduser("~"), "OmniRoute"))
-PORT = os.getenv("OMNIROUTE_PORT", "20128")
-PROBE_URL = os.getenv("OMNIROUTE_PROBE_URL", f"http://localhost:{PORT}/api/v1/models")
+# STEP 285/1566: the watchdog runs standalone (`python3 scripts/omniroute_watchdog.py`),
+# so prepend the repo root to sys.path before importing the shared registry.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts.common.process_registry import is_oculus_process
+
+OMNIROUTE_DIR = os.getenv("OMNIROUTE_DIR",
+                    os.path.join(os.path.expanduser("~"), "OmniRoute"))
+PROBE_URL = "http://localhost:20128/api/v1/models"
 LOG_FILE = "/tmp/omniroute_watchdog.log"
 POLL_SECONDS = 30
 CONSECUTIVE_FAILS_TO_RESTART = 2
@@ -61,7 +67,7 @@ def is_running() -> bool:
     try:
         out = subprocess.run(
             ["ss", "-tlnp"], capture_output=True, text=True, timeout=10).stdout
-        return f":{PORT}" in out
+        return ":20128" in out
     except Exception:
         return False
 
@@ -94,20 +100,28 @@ def _kill_omniroute_only():
                     cmdline = f.read().replace(b"\0", b" ").decode(errors="replace")
             except OSError:
                 continue
-            if "node" in cmdline or "npm" in cmdline:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                    killed += 1
-                    log(f"  killed stale OmniRoute pid {pid}")
-                except (ProcessLookupError, PermissionError):
-                    pass
+            if "node" not in cmdline and "npm" not in cmdline:
+                continue
+            # STEP 285/1566: registry fail-closed gate — the cwd already narrows
+            # to the OmniRoute dir, but never SIGKILL a process the registry
+            # does not recognize as Project (belt-and-braces; fuser frees the
+            # port below regardless).
+            if not is_oculus_process(cmdline):
+                log(f"  _kill_omniroute_only: registry refused non-Project pid {pid}")
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+                log(f"  killed stale OmniRoute pid {pid}")
+            except (ProcessLookupError, PermissionError):
+                pass
     except Exception as e:
         log(f"  _kill_omniroute_only error: {e}")
     if killed == 0:
         log("  _kill_omniroute_only: no stale OmniRoute processes found")
     # Belt-and-braces: free the port if something still holds it.
     try:
-        subprocess.run(["fuser", "-k", "-n", "tcp", PORT],
+        subprocess.run(["fuser", "-k", "-n", "tcp", "20128"],
                        capture_output=True, timeout=10)
     except Exception:
         pass
