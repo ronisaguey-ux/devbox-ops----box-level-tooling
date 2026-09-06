@@ -24,7 +24,7 @@ def page_ws():
     for t in targets:
         if t.get("type") == "page":
             return t["webSocketDebuggerUrl"]
-    raise SystemExit("Surfshark CDP not reachable — is the app running? (launch it with the remote-debugging port 9222 enabled)")
+    raise SystemExit("Surfshark CDP not reachable — is the app running? (snap run --shell surfshark < /home/roni/ss_cdp_real.sh)")
 
 
 class App:

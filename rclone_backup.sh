@@ -11,11 +11,11 @@
 # backed up separately.
 #
 # Usage: nightly via crontab (see comment below), safe to re-run (--update).
-#   47 1 * * * $HOME/scripts/rclone_backup.sh >> /tmp/rclone_backup.log 2>&1
+#   47 1 * * * /home/roni/Roni_workspace/oculus/scripts/rclone_backup.sh >> /tmp/rclone_backup.log 2>&1
 set -u
-CONF="$HOME/.config/rclone/rclone-new.conf"
-SRC="${REPO_DIR:-$HOME/project}"
-DST="${REMOTE:-backup}:${REMOTE_PATH:-workspace/project}"
+CONF="/home/roni/.config/rclone/rclone-new.conf"
+SRC="/home/roni/Roni_workspace/oculus"
+DST="oculus:roni_workspace/oculus"
 LOG="/tmp/rclone_backup.log"
 
 # --tpslimit 10: cap Drive API transactions/sec so the full-tree listing (no
