@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Memory watchdog for the Project workflow.
+"""Memory watchdog for the Oculus workflow.
 
 Watches system RAM every 10 seconds and protects the machine from
 memory-exhaustion crashes (the kind that killed VS Code + the audit
@@ -55,15 +55,13 @@ import time
 # STEP 285/1566: the watchdog runs standalone (`python3 scripts/memory_watchdog.py`),
 # so prepend the repo root to sys.path before importing the shared registry.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scripts.common.process_registry import is_project_process, kill_if_project
+from scripts.common.process_registry import is_oculus_process, kill_if_oculus
 
-WORKFLOW_STATE = os.getenv("WORKFLOW_STATE",
-                     os.path.join(os.path.expanduser("~"), "project_work", "workflow_state.json"))
+WORKFLOW_STATE = "/home/roni/Roni_workspace/audits_plans/workflow_state.json"
 LOG_FILE = "/tmp/memory_watchdog.log"
 # 2026-08-14 (user): the watchdog must wake the main Claude session whenever
 # it acts (pauses/signals). The main session's inbox monitor tails this file.
-MAIN_INBOX = os.getenv("MAIN_INBOX",
-                 os.path.join(os.path.expanduser("~"), "project_work", "claude_main_inbox.json"))
+MAIN_INBOX = "/home/roni/Roni_workspace/audits_plans/claude_main_inbox.json"
 
 PAUSE_BELOW_GB = 2.5      # pause the pipeline when free RAM drops below this
 RESUME_ABOVE_GB = 3.5     # resume when it recovers above this
@@ -105,10 +103,50 @@ SWARM_NAMES = ("claude -p",)
 # Hard cap on concurrent claude -p subprocesses (matches cross_eval's
 # CLAUDE_SWARM_LIMIT=4). Spawned by OmniRoute auto/* models; uncapped they
 # ate 14 GiB on 2026-08-05. Extras get SIGTERMed every poll.
-CLAUDE_SWARM_CAP = 4
+CLAUDE_SWARM_CAP = 4  # 08-24 (owner directive): NEVER raise — this laptop is
+                       # the only machine until the projects make money; the cap
+                       # keeps it survivable. Pausing extras is CORRECT under load.
 
 _PROTECTED_PATTERNS = [
+    # 2026-08-24: the DESKTOP itself must never be paused — a SIGSTOP'd
+    # konsole/plasmashell/kwin looks like a system freeze to the user.
+    'konsole', 'plasmashell', 'kwin_wayland',
+    # 2026-08-24: the "agy" (Antigravity CLI) process — user runs it
+    # separately for their own plans (helpotron); watchdog was SIGSTOP'ing
+    # it as a tier-2 consumer because "antigravity" pattern never matched
+    # the "agy" binary name. Under the "never a watchdog victim" class.
+    'agy',
+    # 2026-08-25: the MAIN Claude session (tmux claude-main ->
+    # run_claude_main.sh -> claude --plugin-dir .../telegram-monitor).
+    # Owner directive: "make sure watchdog never kills u, ur last resort" —
+    # main was NOT matched by any pattern (bare 'claude' is deliberately
+    # excluded by the swarm-name trap), so the worst-case kill floor could
+    # take it. Never a watchdog victim.
+    'run_claude_main.sh', 'claude-main',
     'omniroute',
+    # 2026-08-23: the webchat parallel audit engine (8_23 dual-lane audit).
+    # Unlike the OLD parallel_agents.py (checkpoints every batch), this
+    # engine writes state.json ONLY at pass end — a SIGSTOP mid-pass
+    # freezes every in-flight persona send while freeing 0 RAM, and a
+    # SIGTERM (AUDIT kill floor) loses the whole pass. Same class as
+    # run_batch_executor.py / parallel_agent_cross_eval.py: pipeline brain,
+    # never a watchdog victim.
+    # 2026-08-25: '_teams' variant (the current 24/32-worker oxalpha driver,
+    # grid-ascendent via resume keys) ALSO needs protection — the pattern
+    # above did NOT match '_teams', and the watchdog KILLED the live teams
+    # driver at 04:01 ("to free RAM under 75%") — silenced the marathon for
+    # ~90 min. Owner: "never kills u" class — pipeline brain.
+    'parallel_agents_webchat.py', 'parallel_agents_webchat_teams.py',
+    # 2026-08-24 (audit): the monitor bundle itself must never be paused — a
+    # SIGSTOP'd alerts bundle is silent blindness during the exact pressure
+    # that matters, and pgrep still sees it alive so the supervisor won't
+    # restart it.
+    'monitors_super.sh', 'monitor_persona_quality',
+    # 2026-08-25: session pulse monitor (pulse_monitor.py) — the ghost-engine
+    # culler + stack health pulse. A SIGSTOP'd pulse looks alive to pgrep but
+    # dead to the Monitor harness (task fails on stall), which is exactly how
+    # ghost engines returned while culling was "running". Same never-victim class.
+    'pulse_monitor.py',
     'memory_watchdog',
     'kill_switch',
     'live_monitor',
@@ -170,6 +208,18 @@ def available_gb() -> float:
 
 _KILL_SWITCH_SECRET = os.environ.get('KILL_SWITCH_SECRET', '')
 
+def _load_key_with_perms(key_path: str) -> str:
+    """Load secret key with strict file permission verification (0600 or less)."""
+    try:
+        st = os.stat(key_path)
+        mode = st.st_mode & 0o777
+        if mode & 0o077:  # group/other readable/writable
+            raise PermissionError(f"Key file {key_path} has unsafe permissions {mode:o}; must be 0600 or stricter")
+        with open(key_path, 'r') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ''
+
 def _sign(data: dict) -> str:
     body = json.dumps({k: v for k, v in data.items() if k != 'sig'}, sort_keys=True).encode()
     return hmac.new(_KILL_SWITCH_SECRET.encode(), body, hashlib.sha256).hexdigest()
@@ -182,6 +232,8 @@ def write_paused(paused: bool) -> None:
         tmp = WORKFLOW_STATE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, WORKFLOW_STATE)
     except Exception as e:
         log(f"could not write paused={paused}: {e}")
@@ -270,7 +322,7 @@ def resume_paused():
 
 
 class _PidProc:
-    """psutil.Process-like adapter so kill_if_project can act on a pid + cmdline.
+    """psutil.Process-like adapter so kill_if_oculus can act on a pid + cmdline.
 
     The watchdog scans `ps` args strings, not psutil objects; this adapter lets
     the shared registry's kill gate operate on the same interface.
@@ -296,10 +348,10 @@ def kill_matching(name_fragment: str, sig=signal.SIGTERM, exact_path: bool = Tru
     processes whose executable PATH ends with the fragment are signalled —
     a substring in the command line no longer matches (prevents killing
     unrelated services that merely mention the name, e.g. 'chrome' matching
-    'chromium' or a log path containing the fragment). Critical system/PROJECT
+    'chromium' or a log path containing the fragment). Critical system/OCULUS
     processes are always excluded.
     """
-    _CRITICAL = ("memory_watchdog.py", "run_workflow.py",
+    _CRITICAL = ("memory_watchdog.py", "run_oculus_workflow.py",
                  "/usr/share/code/code", "code --", "plasmashell", "kwin",
                  "kscreenlocker", "ksmserver", "sddm", "Xorg", "Xwayland",
                  "org_kde_powerdevil", "dbus-daemon", "systemd", "wayland",
@@ -343,10 +395,10 @@ def kill_matching(name_fragment: str, sig=signal.SIGTERM, exact_path: bool = Tru
             if _is_protected(args):
                 log(f"  SKIPPED protected PID {pid_s} ({name_fragment})")
                 continue
-            # STEP 285/1566: registry fail-closed gate — only Project-owned
+            # STEP 285/1566: registry fail-closed gate — only Oculus-owned
             # processes may be killed; anything else is logged and refused.
-            if not kill_if_project(_PidProc(pid_s, args), sig):
-                log(f"  REFUSED non-Project PID {pid_s} ({name_fragment})")
+            if not kill_if_oculus(_PidProc(pid_s, args), sig):
+                log(f"  REFUSED non-Oculus PID {pid_s} ({name_fragment})")
                 continue
             log(f"  signalled PID {pid_s} ({name_fragment})")
             notify_main(f"watchdog SIGNALLED pid {pid_s} ({name_fragment})")
@@ -383,7 +435,7 @@ def process_priority(args: str) -> int:
     """Return priority tier for a process cmdline: higher = more important.
     0 = protected/never-kill. Kill order = lowest tier first."""
     # 2026-08-17 (OOM fix): the CDP automation chromes (gc-cdp profile dirs,
-    # --remote-debugging-port 9223/9224) are Project restartable infra AND the
+    # --remote-debugging-port 9223/9224) are Oculus restartable infra AND the
     # box's biggest RAM consumers (14+ GiB with renderers). They MUST be
     # killable so the watchdog can free memory under pressure — the generic
     # "chrome" tier-0 protect below was the OOM root cause (08-17: chrome
@@ -393,13 +445,32 @@ def process_priority(args: str) -> int:
     if "gc-cdp" in args:
         return 3
     if any(x in args for x in (
-            "memory_watchdog.py", "run_workflow.py",
+            "memory_watchdog.py", "run_oculus_workflow.py",
+            # 2026-08-22: the BATCH EXECUTOR is the pipeline's execution brain
+            # (run_batch_executor.py, the orchestrator's child, mid-run at
+            # 1538/1566). It fell into the generic "python" tier-2 bucket and
+            # got SIGSTOP'd repeatedly at the 75% RAM cap (16:08-16:09) —
+            # frozen mid-call, zero RAM freed (SIGSTOP releases nothing), and
+            # repeated freezes can trip the orchestrator's STALL_MINUTES park.
+            # Protect it like the orchestrator; the SIGTERM kill floors are
+            # the real backstop.
+            "run_batch_executor.py",
             # 2026-08-12: the cross_eval PARENT is the pipeline brain — it's
             # ~166MB (frees nothing when paused) while its claude -p children
             # are tier-0 protected. Pausing it stalls synthesis with zero RAM
             # benefit (reviewers block on full pipes). Protect it like the
             # orchestrator; the SIGTERM kill floors are the real backstop.
             "parallel_agent_cross_eval.py",
+            # 2026-08-23 17:30: the webchat parallel audit engine
+            # (scripts/parallel_agents_webchat.py — the 8_23 dual-lane audit,
+            # the current pipeline brain). It is NOT batch-checkpointed like
+            # the OLD parallel_agents.py: it saves state.json only at PASS
+            # END, so a SIGSTOP mid-pass freezes in-flight persona sends
+            # while freeing 0 RAM (the pause churn that wedged the engine all
+            # afternoon at the 75% cap). Protect like run_batch_executor.py;
+            # the SIGTERM kill floors and gc-cdp chromes are the real
+            # backstop (they release 2+GB).
+            "parallel_agents_webchat.py",
             # 2026-08-09: inbox_monitor is the user-requested ack/wake-flag
             # daemon (rule 2026-08-03). Killing it made the supervisor
             # restart-loop it every ~2 min, burning MORE CPU than it saved —
@@ -413,6 +484,13 @@ def process_priority(args: str) -> int:
             # progress; the .sh watchers are tier-3 (most killable!) by the
             # generic matchers. Tier-2 audit subprocesses remain the victims.
             "omniroute_watchdog.py", "phase_monitor.py",
+            # 2026-08-22: lane_watcher.py is supervisor-ensured control-plane
+            # (flips the executor between webchat lanes on rate-limit, pongs
+            # DeepSeek every 10 min). Created 08-17 — AFTER the 08-09 watcher-
+            # family block — so it never got protected; the RAM cap paused it
+            # at 16:22, silently killing lane failover while the supervisor
+            # saw it as alive. Same rationale as the family: never a victim.
+            "lane_watcher.py",
             "stack_supervisor.sh", "watch-inbox.sh",
             "push_live_context.py", "session_heartbeat.sh",
             "generate_claude_context.py",
@@ -438,6 +516,21 @@ def process_priority(args: str) -> int:
             # bg-pty-host + deadman (claude_deadman.sh contains "claude").
             # The ack daemon carries user-facing replies — never a victim:
             "telegram_ack_daemon.py",
+            # 2026-08-22: telegram_auto_responder is supervisor-ensured (the
+            # plain-msg → 8080-expert routing path). It's a small sleep-loop
+            # poller in the generic "python" tier-2 bucket — at the 75% RAM
+            # cap the watchdog re-paused it every 30s cycle (16:13+) even
+            # after SIGSTOP, freezing the message path and spamming the
+            # inbox. Same rationale as the ack daemon: user-facing replies,
+            # never a victim.
+            "telegram_auto_responder.py",
+            # 2026-08-28 18:55: direct_tg_wake.py IS the Telegram wake chain
+            # (sole getUpdates consumer → inboxes → main_wake.log). The 75%
+            # RAM cap SIGSTOP'd it twice in 30s (pauses free 0 MB — it's a
+            # 30MB sleep-loop) and the user's "important" message sat frozen
+            # in Telegram until manual SIGCONT. Never a victim: pausing it
+            # kills inbound waking exactly when pressure is worst.
+            "direct_tg_wake.py",
             "next", "next-server",
             "/usr/share/code/code", "/usr/share/code/resources", "code --",
             # (2026-08-09: VS Code's integrated-terminal shells are
@@ -462,8 +555,57 @@ def process_priority(args: str) -> int:
             # launcher at ~/.npm-global/bin — no "mcp-server" in its name;
             # paused 20:21:52 on 08-14 before this fix).
             "node server.js", "npm exec", "mcp-server", "websearch-deepseek",
+            # 2026-08-22: session-owned PYTHON MCP server (LLM-Drift-Detector/
+            # src/inbox_mcp/server.py — a child of the main claude session;
+            # "python3" generic match put it in tier-2 and it got re-paused
+            # every 30s cycle at the RAM cap, freezing the session's MCP
+            # tooling. Same rationale as the 08-14 node/MCP fix above.
+            "inbox_mcp",
+            # 2026-08-22: session-owned PYTHON MCP server for Agent-Reach
+            # (~/.agent-reach-venv/bin/python -m agent_reach.integrations.
+            # mcp_server — a child of the main claude session; same class as
+            # inbox_mcp, got SIGSTOP'd 20:45:55Z at the RAM cap).
+            "agent_reach",
+            # 2026-08-22: the executor's verification subprocess
+            # (.venv-orch/bin/python -m scripts.plan_validator --test — child
+            # of run_batch_executor.py 1935352; generic "python" tier-2 match
+            # SIGSTOP'd it 20:47:19Z, which hangs the step's verification).
+            # Same rationale as the executor itself: never a victim.
+            "plan_validator",
+            # 2026-08-22 21:47: the executor's pytest verification subprocesses
+            # (.venv-orch/bin/python -m pytest ... --collect-only/-q — children
+            # of run_batch_executor.py; generic "python" tier-2 match SIGSTOP'd
+            # them 21:46:10Z/21:47:10Z at the RAM cap, freezing step
+            # verification = the same stall class as plan_validator).
+            "pytest",
+            # 2026-08-23 02:24: the executor's verify_regression subprocesses
+            # (scripts/verify_regression.py — children of run_batch_executor.py
+            # via the pytest run; generic "python"/"python3" tier-2 match
+            # SIGSTOP'd them 3x in 15 min (555513, 587466, 589018) at the RAM
+            # cap, hanging the step's verification while freeing 0 RAM — the
+            # same stall class as plan_validator/pytest above).
+            "verify_regression",
+            # 2026-08-22: helpotron's vite dev server (node .../vite/bin/vite.js
+            # — user-facing localhost UI; generic "node" match put it in
+            # tier-2 and the RAM cap SIGSTOP'd it 20:28Z, freezing the page
+            # the user was about to open. Same class as "node server.js".
+            "vite",
+            # 2026-08-22: helpotron's npm wrapper for the dev server
+            # (npm run dev ... --port 5173 — parent of the vite child;
+            # "vite" matches the child but not this wrapper, so it got
+            # SIGSTOP'd independently 20:35Z).
+            "npm run dev",
+            # 2026-08-22: the whole helpotron dev stack tree — any node child
+            # under .../helpotron/web/node_modules (esbuild service, HMR
+            # workers, etc.) gets paused individually as a tier-2 "node"
+            # match while the trio is protected; one pattern covers all.
+            "helpotron",
+            # 2026-08-22: helpotron's FastAPI backend (.venv/bin/python uvicorn
+            # server.main:app :8000 — user-facing localhost API; generic
+            # "python" tier-2 match SIGSTOP'd it 20:29Z right after launch.
+            "server.main:app",
             # 2026-08-15: Protected execution engine and bridge infrastructure
-            "execute_master_plan.py", "bridge_monitor.py", "outbox-relay.sh",
+            "execute_master_oculus_plan.py", "bridge_monitor.py", "outbox-relay.sh",
             "outbox-relay", "antigravity", "ss_ctrl.py",
             # 2026-08-14: the telegram auto-responder is the owner's live
             # telegram channel (user-facing replies — same logic as the ack
@@ -474,6 +616,11 @@ def process_priority(args: str) -> int:
             # Pausing Surfshark / NetworkManager / resolved freezes DNS & routing, killing all Wi-Fi & Internet.
             "surfshark", "NetworkManager", "wpa_supplicant", "systemd-resolved",
             "wireguard", "tailscale", "openvpn", "nordvpn", "avahi-daemon",
+            # 2026-08-22: wsdd (Samba WS-Discovery) is a system service like
+            # avahi-daemon — generic "python3" tier-2 match let the watchdog
+            # pause it every 30s cycle (16:15+), killing LAN discovery with
+            # zero RAM benefit. Protected with the network-services family.
+            "wsdd",
             "plasmashell", "kwin", "kscreenlocker",
             "ksmserver", "sddm", "Xorg", "Xwayland",
             "org_kde_powerdevil", "dbus-daemon",
@@ -507,8 +654,7 @@ def omniroute_pids() -> set:
     (KILLED CPU hog ... 342364/345521, 05:01/05:04) and OmniRoute never
     finished booting. Same technique as omniroute_watchdog._kill_omniroute_only.
     """
-    OMNIROUTE_DIR = os.getenv("OMNIROUTE_DIR",
-                    os.path.join(os.path.expanduser("~"), "OmniRoute"))
+    OMNIROUTE_DIR = "/home/roni/Roni_workspace/OmniRoute"
     pids = set()
     try:
         for entry in os.listdir("/proc"):
@@ -654,6 +800,53 @@ def enforce_swarm_cap():
                 for p, a in running[CLAUDE_SWARM_CAP:]])
 
 
+# 2026-08-22 (CDP churn guard): the supervisor re-ensures the lane chromes
+# (gc-cdp 9223 / gc-cdp-hl 9224) within seconds of any SIGTERM, so with RAM
+# chronically at the cap the kill-floor fights the ensure loop — KILL →
+# relaunch → KILL every ~30-90s, spawning fresh chrome mains indefinitely
+# (observed 17:00-17:06, kill cadence ~60s). Track the last SIGTERM per
+# launch signature and refuse to re-kill the same CDP chrome for
+# _CDP_CHURN_GRACE_S so the supervisor's relaunch survives and the loop
+# dies. 2026-08-22 (owner: "get execution up... headless, cloaked browser"):
+# guard now applies to force_free (critical tier) TOO — it kept re-killing the
+# lane driver (cloak chromium on 9224) mid-grace at 21:33/21:38, so execution
+# could never stay up. force_free now walks to the next candidate (bun
+# claude-mem, node gateways) instead; the kernel OOM-killer + swap remain the
+# ultimate backstop.
+_RECENT_CDP_KILLS: dict = {}
+_CDP_CHURN_GRACE_S = 1800.0  # 30 min — one kill per CDP chrome per half-hour max
+_CDP_KILL_GUARD_FILE = "/tmp/cdp_kill_guard.json"
+
+
+def _load_kill_guard() -> dict:
+    """Persisted churn-guard memory (2026-08-22): the dict is in-memory per
+    instance, so a watchdog restart wipes it and a fresh instance re-kills the
+    lane driver minutes after a relaunch (observed 21:43 — the cloak was killed
+    5 min after the watchdog swap). Load the last-kill timestamps from disk."""
+    try:
+        with open(_CDP_KILL_GUARD_FILE) as _f:
+            _data = json.load(_f)
+            return {str(k): float(v) for k, v in _data.items()}
+    except Exception:
+        return {}
+
+
+def _save_kill_guard() -> None:
+    try:
+        with open(_CDP_KILL_GUARD_FILE, "w") as _f:
+            json.dump(_RECENT_CDP_KILLS, _f)
+    except Exception:
+        pass
+
+
+def _cdp_kill_signature(args: str) -> str:
+    """Fingerprint a CDP chrome launch so the churn guard matches re-ensures."""
+    for tok in args.split():
+        if tok.startswith("--user-data-dir="):
+            return tok.split("=", 1)[1]
+    return args[:120]  # no profile dir → args fingerprint
+
+
 def kill_heaviest_nonessential(ps_out: str = None, force_free: bool = False):
     """PAUSE the single heaviest RAM consumer that is NOT the orchestrator,
     the watchdog itself, or this session's claude (2026-08-08: SIGSTOP instead
@@ -702,9 +895,21 @@ def kill_heaviest_nonessential(ps_out: str = None, force_free: bool = False):
         # cap while chrome kept its RSS; the kernel OOM'd the box anyway). CDP
         # chromes are restartable infra, so SIGTERM them to actually release
         # memory. force_free (critical tier) SIGTERMs ANY target, not just
-        # chrome. On registry refusal (non-Project), keep walking candidates.
+        # chrome. On registry refusal (non-Oculus), keep walking candidates.
         if "gc-cdp" in args or force_free:
-            if kill_if_project(_PidProc(pid_s, args), signal.SIGTERM):
+            # Churn guard — 2026-08-22: extended to force_free (see comment at
+            # _RECENT_CDP_KILLS). One SIGTERM per launch signature per
+            # _CDP_CHURN_GRACE_S; force_free walks to the next candidate.
+            sig = _cdp_kill_signature(args)
+            last = _RECENT_CDP_KILLS.get(sig, 0.0)
+            if last and time.time() - last < _CDP_CHURN_GRACE_S:
+                log(f"  SKIP KILL {pid_s} ({args[:60]}) — churn guard "
+                    f"(SIGTERM'd {int(time.time() - last)}s ago; the "
+                    f"ensure loop would just respawn it)")
+                continue
+            if kill_if_oculus(_PidProc(pid_s, args), signal.SIGTERM):
+                _RECENT_CDP_KILLS[_cdp_kill_signature(args)] = time.time()
+                _save_kill_guard()  # persist — a watchdog restart must not forget
                 log(f"  KILLED {pid_s} ({args[:60]}) [priority {prio}] "
                     f"to free RAM under {MAX_USED_PERCENT:.0f}%")
                 notify_main(f"watchdog KILLED pid {pid_s} (free RAM)")
@@ -724,6 +929,7 @@ def main():
                      help="log decisions without killing anything (Step 30 verification)")
     _args = _ap.parse_args()
     DRY_RUN = _args.dry_run
+    _RECENT_CDP_KILLS.update(_load_kill_guard())  # churn-guard memory survives restarts (2026-08-22)
     log("=== memory watchdog started === (dry-run: %s)" % DRY_RUN)
     paused_by_watchdog = False
     global MAX_USED_BYTES

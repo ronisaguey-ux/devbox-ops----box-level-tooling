@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PROJECT execution-lane watcher (2026-08-17 user directive).
+"""OCULUS execution-lane watcher (2026-08-17 user directive).
 
 When the DeepSeek webchat lane gets rate-limited, auto-switch the plan
 executor to the OmniRoute 5-agent team lane; probe DeepSeek with a tiny
@@ -30,15 +30,13 @@ import time
 import urllib.error
 import urllib.request
 
-ORCH_DIR = os.getenv("ORCHESTRATOR_DIR",
-                        os.path.join(os.path.expanduser("~"), "project"))
-WORK_DIR = os.getenv("WORK_DIR",
-                       os.path.join(os.path.expanduser("~"), "project_work"))
-LANE_FILE = os.path.join(WORK_DIR, "execution_lane.env")
-EXEC_LOG = os.path.join(WORK_DIR, "plan_execution.log")
-WATCHDOG_PY = os.path.join(ORCH_DIR, "scripts", "omniroute_watchdog.py")
-VENV_PY = os.path.join(ORCH_DIR, ".venv", "bin", "python")
-ORCH_SH = os.path.join(ORCH_DIR, "workflow_orchestrator", "start_orchestrator.sh")
+OCULUS_DIR = "/home/roni/Roni_workspace/oculus"
+AUDITS_PLANS = "/home/roni/Roni_Workspace/audits_plans"
+LANE_FILE = os.path.join(AUDITS_PLANS, "execution_lane.env")
+EXEC_LOG = os.path.join(AUDITS_PLANS, "plan_execution.log")
+WATCHDOG_PY = os.path.join(OCULUS_DIR, "scripts", "omniroute_watchdog.py")
+VENV_PY = os.path.join(OCULUS_DIR, ".venv-orch", "bin", "python")
+ORCH_SH = os.path.join(OCULUS_DIR, "workflow_orchestrator", "start_orchestrator.sh")
 LOG_FILE = "/tmp/lane_watcher.log"
 
 WEBCHAT_URL = "http://127.0.0.1:8080/v1/chat/completions"
@@ -187,7 +185,7 @@ def proc_running(pattern: str) -> bool:
 
 def kill_orchestrator_and_executor() -> None:
     """Kill the orchestrator + executor (the lane-flip restart point)."""
-    for pat in (r"execute_master_[o]culus_plan\.py", r"run_oculus_[w]orkflow\.py"):
+    for pat in (r"execute_master_[o]culus_plan\.py", r"run_batch_[e]xecutor\.py", r"run_oculus_[w]orkflow\.py"):
         try:
             out = subprocess.run(["pgrep", "-f", pat],
                                  capture_output=True, text=True, timeout=10)
@@ -200,7 +198,7 @@ def kill_orchestrator_and_executor() -> None:
             pass
     time.sleep(2)
     # SIGKILL any survivors (they checkpoint state on every step; resume is safe)
-    for pat in (r"execute_master_[o]culus_plan\.py", r"run_oculus_[w]orkflow\.py"):
+    for pat in (r"execute_master_[o]culus_plan\.py", r"run_batch_[e]xecutor\.py", r"run_oculus_[w]orkflow\.py"):
         try:
             out = subprocess.run(["pgrep", "-f", pat],
                                  capture_output=True, text=True, timeout=10)
@@ -218,7 +216,7 @@ def relaunch_orchestrator() -> bool:
     try:
         subprocess.Popen(
             ["bash", ORCH_SH, "--phase", "execution", "--resume"],
-            cwd=ORCH_DIR, start_new_session=True,
+            cwd=OCULUS_DIR, start_new_session=True,
             stdout=open("/tmp/orch_lane_switch.log", "a"),
             stderr=subprocess.STDOUT)
     except Exception as e:
@@ -251,7 +249,7 @@ def start_omniroute() -> bool:
         log("omniroute watchdog already running")
     else:
         try:
-            subprocess.Popen([VENV_PY, WATCHDOG_PY], cwd=ORCH_DIR,
+            subprocess.Popen([VENV_PY, WATCHDOG_PY], cwd=OCULUS_DIR,
                              start_new_session=True,
                              stdout=open("/tmp/omniroute_watchdog.log", "a"),
                              stderr=subprocess.STDOUT)
@@ -340,14 +338,15 @@ def main() -> None:
             # Detect a DeepSeek rate limit as the executor logs it; flip to team.
             if now - last_rate_check >= 30:
                 last_rate_check = now
-                if proc_running(r"execute_master_[o]culus_plan\.py"):
+                if proc_running(r"(execute_master_[o]culus_plan|run_batch_[e]xecutor)\.py"):
                     if scan_log_for_rate_limit():
                         log("rate-limit signature in exec log -> flipping to omniroute")
                         flip("omniroute")
             time.sleep(15)
         else:
-            # On the omniroute lane: pong DeepSeek every 10 min; flip back when healthy.
-            if now - last_pong >= 600:
+            # On the omniroute lane: pong DeepSeek every 5 min (08-21 user:
+            # flat 5-min retry cadence); flip back when healthy.
+            if now - last_pong >= 300:
                 last_pong = now
                 if pong_deepseek():
                     log("deepseek pong OK -> flipping back to webchat")

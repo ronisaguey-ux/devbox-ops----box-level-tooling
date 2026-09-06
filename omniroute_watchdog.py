@@ -8,7 +8,7 @@ audit produces a false '0 findings' report (fixed by the hard-fail guard).
 This watchdog:
   - Probes http://localhost:20128/api/v1/models every 30s
   - If the port is dead or the probe fails twice in a row, restarts OmniRoute
-    via `npm run dev` in ~/OmniRoute
+    via `npm run dev` in /home/roni/OmniRoute
   - Logs every probe/restart to /tmp/omniroute_watchdog.log
 
 Run: python3 scripts/omniroute_watchdog.py &   (or via start_orchestrator.sh)
@@ -26,8 +26,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.common.process_registry import is_oculus_process
 
-OMNIROUTE_DIR = os.getenv("OMNIROUTE_DIR",
-                    os.path.join(os.path.expanduser("~"), "OmniRoute"))
+OMNIROUTE_DIR = "/home/roni/Roni_workspace/OmniRoute"
 PROBE_URL = "http://localhost:20128/api/v1/models"
 LOG_FILE = "/tmp/omniroute_watchdog.log"
 POLL_SECONDS = 30
@@ -104,10 +103,10 @@ def _kill_omniroute_only():
                 continue
             # STEP 285/1566: registry fail-closed gate — the cwd already narrows
             # to the OmniRoute dir, but never SIGKILL a process the registry
-            # does not recognize as Project (belt-and-braces; fuser frees the
+            # does not recognize as Oculus (belt-and-braces; fuser frees the
             # port below regardless).
             if not is_oculus_process(cmdline):
-                log(f"  _kill_omniroute_only: registry refused non-Project pid {pid}")
+                log(f"  _kill_omniroute_only: registry refused non-Oculus pid {pid}")
                 continue
             try:
                 os.kill(pid, signal.SIGKILL)
