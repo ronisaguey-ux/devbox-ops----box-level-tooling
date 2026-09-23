@@ -14,6 +14,9 @@ the reason the box came back).
 | `omniroute_watchdog.py` | Keeps an [OmniRoute](https://github.com/kgantsov/omniroute)-style LLM gateway alive: probes `/api/v1/models`, restarts on repeated failure. Kills **only** processes whose cwd is the gateway dir (never other apps) |
 | `ss_ctrl.py` | Programmatic Surfshark VPN control through the app's CDP/`__ipcProxy__` bridge: `status`, `connect`, `disconnect`, `rotate`, `countries` — with egress-IP verification on every operation |
 | `rclone_backup.sh` | Cron-friendly backup of a project tree to an rclone remote (Drive/S3/anything), `--update` + tps-limited to avoid quota 403s |
+| `host/oom_watch.sh` | Follows the kernel log for OOM kills of `oculus*` systemd units, alerts the main agent inbox (`OOM_WATCH_INBOX`) and restarts the killed unit (deduped 30s). Run it as a `Restart=always` user service |
+| `host/opencode_wake_1min.sh` | Cron (every minute): re-prompts an idle opencode session **only** when its last turn was cut off by the step cap and the `--arm` sentinel is unexpired. `--arm` / `--disarm` control it |
+| `host/oculus_progress_log.py` | Cron (daily): idempotent SQLite day-counter journal for the Oculus project (`OCULUS_PROGRESS_DB`, default `~/.local/state/oculus/progress.db`) |
 
 ## Setup
 
