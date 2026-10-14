@@ -12,6 +12,13 @@
 #   2. appends to /tmp/main_wake.log       (the session's persistent tail)
 #   3. restarts the killed oculus unit     (auto-heal, deduped 30s)
 INBOX="${OOM_WATCH_INBOX:-$HOME/Roni_workspace/audits_plans/claude_main_inbox.json}"
+# 2026-10-14 (owner: "a bunch of ooms occurred and they never woke u up"). The wake
+# chain moved to the bridge: oc_wake_watch.sh reads the JSONL inbox below, NOT
+# claude_main_inbox.json. Writing only the array meant 123 OOM alerts landed in a file
+# nothing watches - the alarm fired and no one was woken. The array write stays (it is
+# history), and every alert is ALSO appended here as one JSONL line, which is the file
+# the watcher and tele_inbox_gate.py actually read.
+ALERT_INBOX="${OOM_WATCH_ALERT_INBOX:-/tmp/clone_inbox.jsonl}"
 WAKE=/tmp/main_wake.log
 DEDUP=/tmp/oom_watch_last_restart
 
@@ -41,19 +48,42 @@ os.replace(tmp, inbox)
 EOF
       printf '%s [oom-watch] OOM KILL%s: %s\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" "${unit:+ $unit}" "${line:0:140}" >> "$WAKE"
-      # 09-13 (owner: "it needs to wake u up not me"): the alarm already lands in
-      # claude_main_inbox.json above — that is the wake chain
-      # (oculus-direct-tg -> claude_main_inbox.json -> oc_wake_watch.sh ->
-      # tele_inbox_gate.py -> oc_send.js -> the agent session). It never woke
-      # anyone because tele_inbox_gate.py only let `from:"telegram"` through;
-      # it now also accepts ALERT sources, so this inbox write IS the wake.
-      # No Telegram ping — the owner does not want to be the alarm.
+      # The WAKE: one JSONL line in the inbox the watcher polls. flock so a concurrent
+      # writer (the poller, another alert) cannot interleave a half line, and the text
+      # carries the unit so the alarm is actionable without reading the kernel line.
+      python3 - "$ALERT_INBOX" "$ts" "$unit" "$line" <<'EOF'
+import json, os, sys
+import fcntl
+inbox, ts, unit, line = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+rec = {
+    "ts": int(__import__("time").time()),
+    "from": "oom-watch",
+    "sender": "oom-watch",
+    "text": ("OOM KILL " + (unit or "unknown unit") + ": " + line[:200]),
+    "alert": True,
+}
+try:
+    with open(inbox, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.write(json.dumps(rec) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+        fcntl.flock(fh, fcntl.LOCK_UN)
+except Exception as e:
+    sys.stderr.write("oom-watch: could not append the alert to %s: %s\n" % (inbox, e))
+EOF
+      # 09-13 (owner: "it needs to wake u up not me"): tele_inbox_gate.py accepts the
+      # ALERT sources (oom-watch et al) as well as `telegram`, so the JSONL line above
+      # IS the wake. No Telegram ping — the owner does not want to be the alarm.
       # Also nudge the session directly, so a broken watcher cannot swallow it.
+      # --async is required: without it oc_send waits on the prompt and can block an
+      # idle session instead of queueing (2026-10-01 bridge rewrite).
       if [ -x /home/roni/.local/lib/ocbridge/oc_send.js ]; then
-        node /home/roni/.local/lib/ocbridge/oc_send.js \
+        node /home/roni/.local/lib/ocbridge/oc_send.js --async \
           "⚠️ OOM-WATCH: kernel killed ${unit:-a process} — auto-heal has restarted it. Investigate the RAM budget." \
           >/dev/null 2>&1 &
       fi
+
       if [ -n "$unit" ] && ! systemctl --user is-active --quiet "$unit" 2>/dev/null; then
         now="$(date +%s)"
         last="$(cat "$DEDUP" 2>/dev/null || echo 0)"
