@@ -74,15 +74,11 @@ except Exception as e:
 EOF
       # 09-13 (owner: "it needs to wake u up not me"): tele_inbox_gate.py accepts the
       # ALERT sources (oom-watch et al) as well as `telegram`, so the JSONL line above
-      # IS the wake. No Telegram ping — the owner does not want to be the alarm.
-      # Also nudge the session directly, so a broken watcher cannot swallow it.
-      # --async is required: without it oc_send waits on the prompt and can block an
-      # idle session instead of queueing (2026-10-01 bridge rewrite).
-      if [ -x /home/roni/.local/lib/ocbridge/oc_send.js ]; then
-        node /home/roni/.local/lib/ocbridge/oc_send.js --async \
-          "⚠️ OOM-WATCH: kernel killed ${unit:-a process} — auto-heal has restarted it. Investigate the RAM budget." \
-          >/dev/null 2>&1 &
-      fi
+      # IS the wake — and since 2026-10-14 the watcher emits a DISTINCT OOM alarm text
+      # for it instead of the generic "check inbox", so the alarm cannot be mistaken
+      # for a conversation. No Telegram ping — the owner does not want to be the alarm.
+      # The direct oc_send nudge is GONE on purpose: it carried the same event and the
+      # owner would get the alarm twice, which is the confusion this replaced.
 
       if [ -n "$unit" ] && ! systemctl --user is-active --quiet "$unit" 2>/dev/null; then
         now="$(date +%s)"
