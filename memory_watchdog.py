@@ -79,14 +79,33 @@ POLL_SECONDS = 10
 # never-kill list (2026-08-05) so browsers are no longer the sacrificial
 # lamb. The desktop + rclone + claude remain protected regardless (see the
 # never-kill lists).
-MAX_USED_PERCENT = 75.0  # Reverted per user directive
+# RAISED 2026-09-13 (user: "make the watchdog more liberal and not kill
+# everything"): 75% -> 85%. On this 16 GiB box 75% left the cap firing with
+# 4 GiB still available, which is not a machine in trouble. 85% is ~13.7 GiB
+# used / ~2.4 GiB free, and the real OOM protection was never this cap anyway —
+# it is the available-RAM floors below (PAUSE_BELOW_GB 2.5, CRITICAL_BELOW_GB
+# 1.5), which are untouched.
+MAX_USED_PERCENT = 85.0
 MAX_USED_BYTES = None  # computed at startup from /proc/meminfo
 
 # ── User rule (2026-08-03): machine must NEVER exceed 80% total CPU ──
 # Sustained (2-sample average) load above this kills the heaviest non-essential
 # CPU consumer, sharing the same 90s cooldown as the RAM cap.
 # (2026-08-04: user raised CPU cap from 70% → 80%.)
-MAX_CPU_PERCENT = 85.0  # Reverted per user directive
+# RAISED 2026-09-13 (user: "make the watchdog more liberal and not kill
+# everything"): 85% -> 96%, and a momentary breach is no longer enough.
+#
+# total_cpu_percent() averages two samples half a second apart, so ANY one-second
+# all-core spike tripped the cap and SIGSTOPped the heaviest process — 2732 pause
+# events in this log. On an 8-core laptop that is not a fault condition, it is
+# what a compile, a video decode or a headless render looks like, and pausing the
+# process mid-work turns a spike into a broken job (Playwright reports the paused
+# browser as "Target page, context or browser has been closed"). Sustained load is
+# the thing worth acting on, so the cap now has to be breached for
+# CPU_BREACH_POLLS consecutive polls — a full minute at POLL_SECONDS=10 — before
+# anything is paused. One busy minute still gets caught; a busy second does not.
+MAX_CPU_PERCENT = 96.0
+CPU_BREACH_POLLS = 6
 
 # Phase subprocess names we're allowed to terminate (never the orchestrator).
 # 2026-08-05 hardening: parallel_agents.py is NO LONGER protected — it
@@ -157,6 +176,11 @@ _PROTECTED_PATTERNS = [
     'systemd-resolved',
     'wireguard',
     'tailscale',
+    'headroom',
+    'permafrost',
+    'antigravity',
+    'bridge_monitor',
+    'inbox_mcp',
 ]
 
 def _is_protected(cmdline: str) -> bool:
@@ -945,6 +969,7 @@ def main():
         pass
 
     last_kill_ts = 0.0
+    cpu_breaches = 0      # consecutive polls over MAX_CPU_PERCENT
     while True:
         time.sleep(POLL_SECONDS)
         # Step 844: ONE /proc scan per iteration, reused by every check.
@@ -999,19 +1024,31 @@ def main():
             last_kill_ts = now
             continue
 
-        # ── USER RULE: never exceed 70% total CPU ──
+        # ── CPU cap: only SUSTAINED overage counts (2026-09-13) ──
+        # A single poll over the line is a spike, not a problem. The counter
+        # resets the moment CPU drops back under, so only a genuinely pinned
+        # machine — CPU_BREACH_POLLS polls in a row — ever gets acted on.
         cpu_pct = total_cpu_percent()
         if cpu_pct > MAX_CPU_PERCENT:
+            cpu_breaches += 1
+            if cpu_breaches < CPU_BREACH_POLLS:
+                log(f"CPU {cpu_pct:.1f}% over {MAX_CPU_PERCENT:.0f}% "
+                    f"({cpu_breaches}/{CPU_BREACH_POLLS} consecutive) — "
+                    f"spike, not acting")
+                continue
             now = time.time()
             if now - last_kill_ts < 30:
                 log(f"CAP: {cpu_pct:.1f}% CPU used — waiting (cooldown "
                     f"{30 - int(now - last_kill_ts)}s) for release")
                 continue
-            log(f"CAP: {cpu_pct:.1f}% CPU used (limit {MAX_CPU_PERCENT:.0f}%) — "
-                f"pausing heaviest non-essential process")
+            log(f"CAP: {cpu_pct:.1f}% CPU sustained over "
+                f"{CPU_BREACH_POLLS * POLL_SECONDS}s (limit "
+                f"{MAX_CPU_PERCENT:.0f}%) — pausing heaviest non-essential process")
             kill_heaviest_cpu_nonessential(procs)
             last_kill_ts = now
+            cpu_breaches = 0
             continue
+        cpu_breaches = 0
 
         # ── Under all caps: resume anything we paused (2026-08-08) ──
         resume_paused()
